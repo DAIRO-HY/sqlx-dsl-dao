@@ -1,0 +1,15 @@
+[package]
+name = "sqlx-dsl-dao-sample"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+sqlx-context = "0.0.1"
+sqlx = { version = "0.8", features = ["runtime-async-std", "sqlite", "macros"] }
+async-std = { version = "1", features = ["attributes"] }
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+sqlx-dsl-dao = { path = "../sqlx-dsl-dao" }
+sqlx = { version = "0.8", features = ["runtime-async-std", "sqlite", "macros"] }
+async-std = { version = "1", features = ["attributes"] }

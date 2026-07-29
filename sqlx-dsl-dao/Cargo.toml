@@ -1,0 +1,18 @@
+[package]
+name = "sqlx-dsl-dao"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Build-time DAO code generator for sqlx (SQLite): generates CRUD from table schema plus dynamic-SQL functions from a MyBatis-like DSL."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/DAIRO-HY/sqlx-dsl-dao"
+keywords = ["sqlx", "sqlite", "codegen", "dao", "orm"]
+categories = ["database", "development-tools::build-utils"]
+
+[dependencies]
+sqlx = { version = "0.8", features = ["runtime-async-std", "sqlite", "macros"] }
+syn = { version = "2", features = ["full", "extra-traits", "parsing", "visit"] }
+prettyplease = "0.2" #代码格式化
+chrono = "0.4"
+serde = { version = "1", features = ["derive","rc"] }

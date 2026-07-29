@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["sqlx-dsl-dao-sample", "sqlx-dsl-dao"]

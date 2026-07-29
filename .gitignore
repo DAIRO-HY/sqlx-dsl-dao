@@ -1,0 +1,15 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+
+# sqlx-dsl-dao-sample 示例项目运行时生成的数据库（build.rs 每次构建都会自动重建）
+sqlx-dsl-dao-sample/sample.db
+
+# macOS
+.DS_Store
+
+# JetBrains IDE
+.idea/
+
+# Claude Code
+.claude/
