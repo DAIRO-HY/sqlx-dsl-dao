@@ -175,6 +175,10 @@ fn read_column_info_from_sql_line(line: &str) -> Option<table::Column> {
 
     let line = line[next_space_index..].trim().to_string().to_uppercase();
     let is_primary_key = line.contains("PRIMARY KEY"); // 判断是否包含 PRIMARY KEY
+    // 注：这里刻意不对主键做隐式 NOT NULL 特殊处理——sqlx 对 SQLite 的可空性推断在
+    // 不同查询形态下并不完全一致(部分能证明 NOT NULL，部分不能)，如果让实体结构体
+    // 强制声明为非 Option，会在推断不出 NOT NULL 的查询里产生类型不匹配；保持和
+    // sqlx 实际推断结果一致(可空)更稳妥，业务代码里访问 id 字段时按需 unwrap。
     let is_nullable = !line.contains("NOT NULL"); // 判断是否包含 NOT NULL
     let is_auto_increment = line.contains("AUTOINCREMENT") || line.contains("AUTO_INCREMENT"); // 判断是否包含 AUTOINCREMENT 或 AUTO_INCREMENT
 
