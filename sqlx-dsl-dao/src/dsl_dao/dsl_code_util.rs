@@ -13,16 +13,38 @@ pub async fn make_source(conn: &SqlitePool, dsl: &DslFunction) {
         }
     }
 
+    //返回可选的单个标量时,需要知道该列是否可为空:可为空的列sqlx解码出来的已经是Option
+    let scalar_nullable = dsl.crud_type() == CrudType::Read
+        && dsl.return_option
+        && !dsl.return_list
+        && !dsl.is_page
+        && is_scalar(&dsl.return_type)
+        && dsl
+            .result_entity(conn)
+            .await
+            .columns
+            .first()
+            .is_some_and(|it| it.is_nullable);
+
     /// 添加到待生成的代码
-    write_util::add_method_source(&mod_name, make_method_src(dsl));
+    write_util::add_method_source(&mod_name, make_method_src(dsl, scalar_nullable));
     if dsl.param_type.is_some() {
         /// 函数参数的Entity
         write_util::add_entity(&mod_name, dsl.param_entity());
     }
 }
 
+/// 是否是用query_scalar查询的标量类型
+fn is_scalar(return_type: &str) -> bool {
+    return_type == "bool"
+        || return_type == "i64"
+        || return_type == "String"
+        || return_type == "chrono::NaiveDateTime"
+}
+
 /// 生成函数代码
-fn make_method_src(dsl: &DslFunction) -> String {
+/// `scalar_nullable`: 返回可选的单个标量,且该列可为空
+fn make_method_src(dsl: &DslFunction, scalar_nullable: bool) -> String {
     /// sqlx查询函数:query_as_with、query_scalar...
     let mut query_func = "";
 
@@ -30,10 +52,13 @@ fn make_method_src(dsl: &DslFunction) -> String {
     let mut return_type = dsl.return_type.clone();
 
     // sqlx绑定类型
-    let bind_type = dsl.return_type.clone();
+    let mut bind_type = dsl.return_type.clone();
 
     // sqlx遍历数据方式
     let mut fetch_type = "fetch_one";
+
+    // 对查询结果的转换
+    let mut fetch_map = "";
 
     let exec_sql: String;
 
@@ -120,14 +145,21 @@ fn make_method_src(dsl: &DslFunction) -> String {
                     //如果返回值是一个列表
                     return_type = format!("Vec<{}>", return_type);
                     fetch_type = "fetch_all"
+                } else if dsl.return_option {
+                    //没有查到数据时返回None
+                    fetch_type = "fetch_optional";
+                    if scalar_nullable {
+                        //列本身可为空时查询结果是Option<Option<T>>,查不到数据和值为NULL都返回None
+                        fetch_map = ".map(Option::flatten)";
+                    }
                 }
                 //如果是动态生成sql语句,只能动态拼接
                 if dsl.has_if_condition() {
-                    if dsl.return_type == "bool"
-                        || dsl.return_type == "i64"
-                        || dsl.return_type == "String"
-                        || dsl.return_type == "chrono::NaiveDateTime"
-                    {
+                    if is_scalar(&dsl.return_type) {
+                        if scalar_nullable {
+                            //可为空的列要按Option解码
+                            bind_type = format!("Option<{}>", bind_type);
+                        }
                         query_func = "query_scalar_with::<_, [BIND_TYPE], _>"
                     } else {
                         query_func = "query_as_with::<_, [BIND_TYPE], _>"
@@ -141,22 +173,18 @@ fn make_method_src(dsl: &DslFunction) -> String {
                         let mut __args = sqlx::sqlite::SqliteArguments::default();
                         [METHOD_PARAM_AS_REF]
                         [EXEC_SQL]
-                        sqlx::[QUERY_FUNC](&__sql, [ARGS]).[FETCH_TYPE](ctx).await
+                        sqlx::[QUERY_FUNC](&__sql, [ARGS]).[FETCH_TYPE](ctx).await[FETCH_MAP]
                     }
                     "##
                 } else {
                     (exec_sql, exec_args) = dsl.native_sql_and_args();
-                    if dsl.return_type == "bool"
-                        || dsl.return_type == "i64"
-                        || dsl.return_type == "String"
-                        || dsl.return_type == "chrono::NaiveDateTime"
-                    {
+                    if is_scalar(&dsl.return_type) {
                         r##"
                         /// [COMMENT]
                         pub async fn [FN_NAME](ctx: &mut sqlx_context::DbContext, [METHOD_PARAM]) -> Result<[RETURN_TYPE], sqlx::Error>
                         {
                             [METHOD_PARAM_AS_REF]
-                            sqlx::query_scalar!(r#"[EXEC_SQL]"#,[ARGS]).[FETCH_TYPE](ctx).await
+                            sqlx::query_scalar!(r#"[EXEC_SQL]"#,[ARGS]).[FETCH_TYPE](ctx).await[FETCH_MAP]
                         }
                         "##
                     } else {
@@ -235,4 +263,5 @@ fn make_method_src(dsl: &DslFunction) -> String {
         .replace("[EXEC_SQL]", &exec_sql)
         .replace("[ARGS]", &exec_args)
         .replace("[FETCH_TYPE]", fetch_type)
+        .replace("[FETCH_MAP]", fetch_map)
 }

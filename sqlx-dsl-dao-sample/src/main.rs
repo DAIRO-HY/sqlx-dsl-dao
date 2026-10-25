@@ -309,4 +309,71 @@ mod tests {
         assert!(device_dao::insert(&mut ctx, &device()).await.is_err());
         assert!(ctx.take_write_log().is_empty());
     }
+
+    /// 插入 alice(age=28) 和 dave(age 为空),返回它们的id
+    async fn insert_users(ctx: &mut DbContext) -> (i64, i64) {
+        let alice = user_dao::insert(
+            ctx,
+            &user_dao::User {
+                name: "Alice".to_string(),
+                email: "alice@example.com".to_string(),
+                age: Some(28),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let dave = user_dao::insert(
+            ctx,
+            &user_dao::User {
+                name: "Dave".to_string(),
+                email: "dave@example.com".to_string(),
+                age: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (alice, dave)
+    }
+
+    #[async_std::test]
+    async fn optional_return_static_sql() {
+        let mut ctx = memory_ctx().await;
+        let (alice, dave) = insert_users(&mut ctx).await;
+
+        // 实体
+        let user = user_dao::find_user_by_email(&mut ctx, "alice@example.com").await.unwrap();
+        assert_eq!(user.map(|it| it.id), Some(Some(alice)));
+        assert!(user_dao::find_user_by_email(&mut ctx, "none@example.com").await.unwrap().is_none());
+
+        // 标量
+        assert_eq!(user_dao::find_user_id_by_email(&mut ctx, "dave@example.com").await.unwrap(), Some(dave));
+        assert_eq!(user_dao::find_user_id_by_email(&mut ctx, "none@example.com").await.unwrap(), None);
+
+        // 可为空的标量列
+        assert_eq!(user_dao::find_user_age(&mut ctx, alice).await.unwrap(), Some(28));
+        assert_eq!(user_dao::find_user_age(&mut ctx, dave).await.unwrap(), None);
+        assert_eq!(user_dao::find_user_age(&mut ctx, 9999).await.unwrap(), None);
+    }
+
+    #[async_std::test]
+    async fn optional_return_dynamic_sql() {
+        let mut ctx = memory_ctx().await;
+        let (alice, dave) = insert_users(&mut ctx).await;
+
+        // 实体
+        let user = user_dao::find_first_user(&mut ctx, None).await.unwrap();
+        assert_eq!(user.map(|it| it.id), Some(Some(alice)));
+        assert!(user_dao::find_first_user(&mut ctx, Some(100)).await.unwrap().is_none());
+
+        // 标量
+        assert_eq!(user_dao::find_first_user_id(&mut ctx, Some(20)).await.unwrap(), Some(alice));
+        assert_eq!(user_dao::find_first_user_id(&mut ctx, Some(100)).await.unwrap(), None);
+
+        // 可为空的标量列
+        assert_eq!(user_dao::find_first_user_age(&mut ctx, None).await.unwrap(), Some(28));
+        assert_eq!(user_dao::find_first_user_age(&mut ctx, Some(dave)).await.unwrap(), None);
+        assert_eq!(user_dao::find_first_user_age(&mut ctx, Some(dave + 1)).await.unwrap(), None);
+    }
 }
