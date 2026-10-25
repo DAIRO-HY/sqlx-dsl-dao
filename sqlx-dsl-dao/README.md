@@ -10,13 +10,15 @@
 
 生成的函数体使用 `sqlx::query!` / `query_as!` / `query_scalar!` 等**编译期检查宏**，因此编译期就能发现字段名写错、类型不匹配等问题。
 
-> 当前版本 `0.0.1`，只支持 **SQLite**。API 还在早期阶段，可能有breaking change。
+> 当前版本 `0.0.2`，只支持 **SQLite**。API 还在早期阶段，可能有breaking change。
 
 ## 目录
 
 - [快速开始](#快速开始)
 - [约定：DbContext](#约定dbcontext)
 - [基础CRUD生成规则](#基础crud生成规则)
+- [生成配置 GenerateConfig](#生成配置-generateconfig)
+- [写SQL日志](#写sql日志)
 - [DSL 语法](#dsl-语法)
 - [字段类型映射](#字段类型映射)
 - [注意事项](#注意事项)
@@ -28,15 +30,17 @@
 
 ```toml
 [dependencies]
-sqlx-context = "0.0.1"
+sqlx-context = "0.0.2"
 sqlx = { version = "0.8", features = ["runtime-async-std", "sqlite", "macros"] }
 
 [build-dependencies]
-sqlx-dsl-dao = "0.0.1"
+sqlx-dsl-dao = "0.0.2"
 sqlx = { version = "0.8", features = ["runtime-async-std", "sqlite", "macros"] }
 async-std = { version = "1", features = ["attributes"] }
 ```
 
+> `sqlx-dsl-dao 0.0.2` 生成的代码需要 `sqlx-context 0.0.2`（写SQL日志相关的API）。
+>
 > `sqlx` 的 `runtime-async-std` / `runtime-tokio` 只能二选一，且要和你项目其它地方用到的 sqlx 保持一致（Cargo 会统一整个依赖图的 feature）。
 
 ### 2. 写 `build.rs`
@@ -151,7 +155,60 @@ let mut ctx = DbContext::new(pool);
 | `deleted_at` | `INTEGER`（毫秒时间戳） | 逻辑删除时自动写入删除时间 |
 | `deleted_by` | `VARCHAR`/`TEXT` | 逻辑删除函数会多一个 `deleted_by: String` 参数 |
 
-自增主键列（`INTEGER PRIMARY KEY AUTOINCREMENT`）不会出现在 `insert()` 的参数里。
+自增主键列（`INTEGER PRIMARY KEY AUTOINCREMENT`）不会出现在 `insert()` 的参数里；非自增主键（如 `INT8 PRIMARY KEY NOT NULL`，由业务生成）会和其它列一起插入。`insert()` / `update()` 的列顺序和建表语句里的列顺序一致。
+
+以上约定可以通过 [`GenerateConfig::disable_convention`](#生成配置-generateconfig) 按表、按列关闭，关闭后该列就当作普通列处理。
+
+## 生成配置 GenerateConfig
+
+需要更多控制时用 `generate_with_config()` 代替 `generate()`：
+
+```rust
+let config = sqlx_dsl_dao::GenerateConfig::new()
+    // 字段名 -> Rust类型 的覆盖规则，等同于 generate() 的第三个参数
+    .type_override("property", "String")
+    // user_token 表的 version 列是客户端版本号，不是乐观锁
+    .disable_convention("user_token.version")
+    // 表DAO生成的SQL关键字使用小写
+    .lowercase_keywords(true);
+sqlx_dsl_dao::generate_with_config(pool, "dsl", &config).await;
+```
+
+| 方法 | 说明 |
+|---|---|
+| `type_override(列名, Rust类型)` / `type_overrides(&HashMap)` | 按列名强制指定 Rust 类型 |
+| `disable_convention(规则)` | 关闭约定字段的特殊处理，规则可以是 `"version"`（所有表的该列）、`"user_token.version"`（某张表的某列）、`"user_token.*"`（某张表的全部约定）、`"*"`（全部关闭）。列名只能是 `version` / `created_at` / `updated_at` / `deleted` / `deleted_at` / `deleted_by`，写错会在 build.rs 里 panic |
+| `lowercase_keywords(true)` | 表DAO生成的SQL关键字使用小写（`insert into t (...) values (...)`、`update t set ... where ...`、`delete from`、`select`），默认大写。DSL 文件里手写的SQL不受影响，始终原样保留 |
+
+关闭约定后的行为（以 `version` 为例）：`insert()` 会把它作为普通列插入，`update()` 会把它作为普通列更新，不再自动 `+1`，也不加乐观锁条件。
+
+## 写SQL日志
+
+用于把每一条成功执行的写SQL及其参数记录下来（比如存到一张日志表里，供其它节点重放）。
+
+```rust
+ctx.enable_write_log();
+ctx.begin().await?;
+dfs_file_dao::insert(&mut ctx, &file).await?;
+dfs_file_dao::update_state(&mut ctx, id, 1, None).await?;
+
+// commit 之前取出
+for log in ctx.take_write_log() {
+    // log.sql:    实际执行的SQL，占位符为 ?
+    // log.params: Vec<serde_json::Value>，按绑定顺序排列
+    println!("{} {}", log.sql, log.params_json()); // insert into dfs_file (...) values (?, ...) [1,"a.mp4",null,...]
+}
+ctx.commit().await?;
+```
+
+- 记录范围：表DAO的 `insert` / `update` / `delete` / `set_delete` / `set_delete_ignone_version`，以及 DSL 里所有非 `SELECT` 的函数。查询不记录。
+- 只在执行成功后记录（`update` 影响 0 行也算执行成功，同样会记录）；执行失败不记录。
+- 事务 `rollback()` 时，会丢弃本次事务期间记录的日志。
+- 记录的是**真正执行的那一句SQL**：DSL 里 `@if` / `@each` 展开之后是什么就记什么；DSL 里写的SQL不改大小写、不重新格式化（只会把多行拼成一行）；表DAO的SQL受 `lowercase_keywords` 控制。
+- 参数通过 `sqlx_context::log_value()` 转换，复用 sqlx 自己的编码结果：整数/浮点数 -> number，字符串 -> string，`None` -> `null`，`bool` -> `true`/`false`，`Vec<u8>` -> 标准 base64 字符串。
+- 没有开启时，每个写函数只多一次 `is_write_log_enabled()` 判断，不会构建参数。
+- 手写的SQL也可以调用 `ctx.push_write_log(sql, params)` 加入日志。
+- 把取出的日志再用生成的DAO写入日志表时，这些写入本身也会被记录；可以在写日志表前 `ctx.disable_write_log()`，或者再 `take_write_log()` 一次丢弃。
 
 ## DSL 语法
 
@@ -160,7 +217,7 @@ let mut ctx = DbContext::new(pool);
 | 指令 | 说明 |
 |---|---|
 | `-- @name 函数名` | 生成的函数名 |
-| `-- @param 参数名:类型` | 声明一个参数；类型后加 `?` 表示 `Option`，支持 `List<T>` 映射为 `Vec<T>`。省略时会尝试从SQL里用到的 `:xxx` 占位符和返回列自动补全 |
+| `-- @param 参数名:类型` | 声明一个参数；类型后加 `?` 表示 `Option`，支持 `List<T>` 映射为 `Vec<T>`。省略时会尝试从SQL里用到的 `:xxx` 占位符自动补全，类型依次按：查询的返回列、数据库里同名的表字段（各表中类型一致时）、参数名启发式规则推断。建议写SQL的参数都显式声明类型 |
 | `-- @param_type 类型名` | 把所有参数打包进一个结构体（超过4个参数时会自动生成一个） |
 | `-- @return 类型` | 返回值类型；`List<T>` 表示返回 `Vec<T>`，`T?` 表示返回 `Option<T>`；省略时会按查询列自动推断（多列会生成一个 `xxxTemp` 结构体） |
 | `-- @page` | 分页查询，函数会多一个 `page_in: PageIn` 参数，返回 `(总数i64, Vec<T>)` |
@@ -185,21 +242,27 @@ SELECT * FROM user WHERE deleted = 0
 
 ## 字段类型映射
 
+类型名不区分大小写：
+
 | 数据库类型 | Rust类型 |
 |---|---|
-| `INTEGER` / `INT` / `BIGINT` / `INT8/16/32/64` | `i64` |
-| `VARCHAR` / `TEXT` / `CHAR*` | `String` |
+| `INTEGER` / `INT` / `BIGINT` / `INT8` / `INT16` / `INT32` / `INT64` | `i64` |
+| `VARCHAR` / `VARCHAR(n)` / `CHAR(n)` / `TEXT` | `String` |
 | `BOOLEAN` | `bool` |
 | `FLOAT` | `f32` |
 | `DOUBLE` | `f64` |
 | `DATETIME` | `chrono::NaiveDateTime` |
-| 其它 / 列名以 `date` 结尾 | 默认按列名/类型名做启发式判断，兜底用 `String` |
+| 以上都不匹配，且列名以 `date` 结尾 | `chrono::NaiveDateTime` |
+| 其它 | 原样输出类型名（需要用 `type_override` 指定） |
 
 可为空的列（未声明 `NOT NULL`）会自动包一层 `Option<T>`。
 
 如果内置规则不满足需求，`generate()` 的第三个参数 `type_overrides: &HashMap<String, String>` 可以按**列名**强制指定 Rust 类型。
 
 ## 注意事项
+
+- 建表语句的解析兼容：`COLLATE NOCASE`、行尾注释（包括逗号和 `--` 紧贴的写法）、显式 `NULL`、小写的 `text` / `default` / `unique`、表级 `UNIQUE` / `PRIMARY KEY` / `FOREIGN KEY` / `CONSTRAINT` / `CHECK` 约束行。索引（包括带 `WHERE` 的部分唯一索引）不影响生成。
+- DSL 动态SQL函数内部使用的局部变量都以 `__` 开头（`__sql`、`__args` 等），DSL 参数名不要以 `__` 开头。
 
 - `include!(concat!(env!("OUT_DIR"), "/dao.rs"))` **必须放在 crate 根**：分页函数里用 `super::PageIn` 引用公共结构体，嵌套在其它 `mod` 里会导致 `super` 指向错误的模块。
 - 生成的代码里大量使用 `sqlx::query!` 等编译期检查宏，这要求编译当前crate时 `DATABASE_URL` 环境变量指向一个**已经建好表结构**的真实数据库。推荐在 `build.rs` 里用 `println!("cargo:rustc-env=DATABASE_URL=...")` 注入，而不是依赖外部 `.env`。
@@ -208,7 +271,9 @@ SELECT * FROM user WHERE deleted = 0
 
 ## 完整示例
 
-仓库里的 [`sqlx-dsl-dao-sample`](../sqlx-dsl-dao-sample) 是一个可以直接 `cargo run` 的完整示例，覆盖了基础CRUD、乐观锁、逻辑删除、`@if`/`@each`/`@page` 等全部特性。
+仓库里的 [`sqlx-dsl-dao-sample`](../sqlx-dsl-dao-sample) 是一个可以直接 `cargo run` 的完整示例，覆盖了基础CRUD、乐观锁、逻辑删除、`@if`/`@each`/`@page`、关闭约定字段、写SQL日志等全部特性，`cargo test -p sqlx-dsl-dao-sample` 可以跑对应的测试。
+
+[`sqlx-dsl-dao-dfs-compat`](../sqlx-dsl-dao-dfs-compat) 用一组线上实际使用的建表语句验证兼容性（小写关键字 + 写SQL日志）。
 
 ## License
 

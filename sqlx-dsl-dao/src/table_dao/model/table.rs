@@ -1,3 +1,4 @@
+use crate::config::{self, CONVENTION_COLUMNS, kw};
 use crate::table_dao::table_util;
 use crate::utils;
 use serde::Serialize;
@@ -37,24 +38,37 @@ pub struct Column {
 }
 
 impl Entity {
+    /// 该列是否是一个启用中的约定字段(version/created_at/updated_at/deleted/deleted_at/deleted_by)
+    fn is_convention(&self, column: &Column) -> bool {
+        CONVENTION_COLUMNS.contains(&column.name.as_str())
+            && config::convention_enabled(&self.name, &column.name)
+    }
+
+    /// 判断是否有启用中的某个约定字段
+    fn has_convention(&self, name: &str) -> bool {
+        self.columns
+            .iter()
+            .any(|it| it.name == name && self.is_convention(it))
+    }
+
     /// 判断是否有version列
     pub fn has_version(&self) -> bool {
-        self.columns.iter().any(|it| it.name == "version")
+        self.has_convention("version")
     }
 
     /// 判断是否有deleted列
     pub fn has_deleted(&self) -> bool {
-        self.columns.iter().any(|it| it.name == "deleted")
+        self.has_convention("deleted")
     }
 
     /// 判断是否有deleted_at列
     pub fn has_deleted_at(&self) -> bool {
-        self.columns.iter().any(|it| it.name == "deleted_at")
+        self.has_convention("deleted_at")
     }
 
     /// 判断是否有deleted_by列
     pub fn has_deleted_by(&self) -> bool {
-        self.columns.iter().any(|it| it.name == "deleted_by")
+        self.has_convention("deleted_by")
     }
 
     /// 获取主键列列表
@@ -96,32 +110,6 @@ impl Entity {
         .to_string()
     }
 
-    // /// 生成实体类的源代码
-    // pub fn make_entity_src(&self) -> String {
-    //     let entity_name = self.get_entity_name();
-    //     let mut entity_src = String::new();
-    //     entity_src
-    //         .push_str("#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, sqlx::FromRow)]\n");
-    //     entity_src.push_str(&format!("pub struct {} {{\n", entity_name));
-    //     self.columns.iter().for_each(|it| {
-    //         entity_src.push_str(it.make_member_src().as_str());
-    //     });
-    //     entity_src.push_str("}\n");
-    //
-    //     /// 让函数参数可以“接受多种类型的引用形式”，并统一转成某种引用类型使用
-    //     entity_src.push_str(
-    //         r#"
-    //     impl AsRef<[ENTITY]> for [ENTITY] {
-    //         fn as_ref(&self) -> &[ENTITY] {
-    //             self
-    //         }
-    //     }"#
-    //             .replace("[ENTITY]", entity_name.as_str())
-    //             .as_str(),
-    //     );
-    //     entity_src
-    // }
-
     /// 生成分页查询条件实体类的源代码
     pub fn make_query_entity_src(&self) -> String {
         let mut entity_src = String::new();
@@ -134,13 +122,6 @@ impl Entity {
             let mut field_type = table_util::db_type_to_rust(&it.data_type, &it.name).to_string();
             field_type = format!("QueryModel<{}>", field_type);
             entity_src.push_str(&format!("    pub {}: {},\n", it.name, field_type));
-            // match it.name.as_str() {
-            //     "created_at" | "updated_at" => {
-            //         entity_src.push_str(&format!("    pub {}_start: Option<i64>,\n", it.name));
-            //         entity_src.push_str(&format!("    pub {}_end: Option<i64>,\n", it.name));
-            //     }
-            //     _ => {}
-            // }
         });
         entity_src.push_str("}\n");
         entity_src
@@ -157,13 +138,6 @@ impl Entity {
         })
     }
 
-    // fn get_insert_columns(&self) -> Vec<&ColumnInfo> {
-    //     self.columns
-    //         .iter()
-    //         .filter(|it| it.name != "version" && it.name != "created_at" && it.name != "updated_at")
-    //         .collect()
-    // }
-
     /// 生成插入函数的源代码
     pub fn make_insert_func(&self) -> String {
         let mut insert_columns: Vec<&str> = Vec::new(); // 构建插入列列表
@@ -177,27 +151,19 @@ impl Entity {
                 if it.is_auto_increment && it.is_primary_key {
                     return false;
                 }
-                if it.name == "deleted_at" {
-                    return false;
-                }
-                if it.name == "deleted_by" {
-                    return false;
-                }
-                if it.name == "deleted" {
-                    return false;
-                }
-                if it.name == "version" {
-                    return false;
-                }
-                true
+
+                //deleted/deleted_at/deleted_by/version 由数据库默认值或后续操作维护
+                !(self.is_convention(it)
+                    && matches!(
+                        it.name.as_str(),
+                        "deleted_at" | "deleted_by" | "deleted" | "version"
+                    ))
             })
             .for_each(|it| {
                 insert_columns.push(it.name.as_str());
                 insert_params_replace.push("?");
-                if it.name == "created_at" {
-                    need_now = true;
-                    insert_params.push("timestamp".to_string());
-                } else if it.name == "updated_at" {
+                if self.is_convention(it) {
+                    //created_at/updated_at 自动写入当前时间
                     need_now = true;
                     insert_params.push("timestamp".to_string());
                 } else {
@@ -207,21 +173,25 @@ impl Entity {
 
         // 构建插入SQL语句
         let mut insert_sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
+            "{} {} ({}) {} ({})",
+            kw("INSERT INTO"),
             self.name,
             insert_columns.join(", "),
+            kw("VALUES"),
             insert_params_replace.join(", ")
         );
 
         let fn_template = if let Some(key) = self.auto_increment_and_primary_column() {
             // 如果有自增且主键的列则在插入时返回该列的值以方便后续操作
-            insert_sql.push_str(&format!(" RETURNING {}", key));
+            insert_sql.push_str(&format!(" {} {}", kw("RETURNING"), key));
             r#"
             /// 插入数据
             pub async fn insert(ctx: &mut sqlx_context::DbContext, entity: impl AsRef<[ENTITY]>) -> Result<i64, sqlx::Error>{
                 [TIME_CODE]
                 let entity = entity.as_ref();
-                sqlx::query_scalar!("[SQL]", [PARAM]).fetch_one(ctx).await
+                let id = sqlx::query_scalar!("[SQL]", [PARAM]).fetch_one(&mut *ctx).await?;
+                [WRITE_LOG]
+                Ok(id)
             }"#
         } else {
             r#"
@@ -229,7 +199,8 @@ impl Entity {
             pub async fn insert(ctx: &mut sqlx_context::DbContext, entity: impl AsRef<[ENTITY]>) -> Result<(),sqlx::Error>{
                 [TIME_CODE]
                 let entity = entity.as_ref();
-                sqlx::query!("[SQL]", [PARAM]).execute(ctx).await?;
+                sqlx::query!("[SQL]", [PARAM]).execute(&mut *ctx).await?;
+                [WRITE_LOG]
                 Ok(())
             }"#
         };
@@ -241,6 +212,7 @@ impl Entity {
         };
         fn_template
             .replace("[TIME_CODE]", time_code)
+            .replace("[WRITE_LOG]", &utils::write_log_src(&format!("\"{}\"", insert_sql), &insert_params))
             .replace("[SQL]", &insert_sql)
             .replace("[PARAM]", &(insert_params.join(", ")))
             .replace("[ENTITY]", &utils::snake_to_pascal(&self.name, "_"))
@@ -280,17 +252,20 @@ impl Entity {
         {
             sqlx::query_as!(
                 [ENTITY],
-                "SELECT [FIELDS] FROM [TABLE] WHERE [WHERE]",
+                "[SELECT] [FIELDS] [FROM] [TABLE] [WHERE_KW] [WHERE]",
                 [PARAM]
             ).fetch_one(ctx).await
         }
         "##;
         select_one_template
             .replace("[FUNC_PARAMS]", &func_params.join(", "))
+            .replace("[SELECT]", &kw("SELECT"))
+            .replace("[FROM]", &kw("FROM"))
+            .replace("[WHERE_KW]", &kw("WHERE"))
             .replace("[TABLE]", &self.name)
             .replace("[FIELDS]", &filed_columns.join(", "))
             .replace("[ENTITY]", &utils::snake_to_pascal(&self.name, "_"))
-            .replace("[WHERE]", &where_columns.join(" AND "))
+            .replace("[WHERE]", &where_columns.join(&format!(" {} ", kw("AND"))))
             .replace("[PARAM]", &where_params.join(", "))
     }
 
@@ -305,7 +280,7 @@ impl Entity {
                 /// 查询所有未删除的数据
                 pub async fn select_all(ctx: &mut sqlx_context::DbContext) -> Result<Vec<[ENTITY]>, sqlx::Error>
                 {
-                    sqlx::query_as!([ENTITY], "SELECT * FROM [TABLE] where deleted = 0")
+                    sqlx::query_as!([ENTITY], "[SELECT] * [FROM] [TABLE] [WHERE_KW] deleted = 0")
                         .fetch_all(ctx)
                         .await
                 }
@@ -316,7 +291,7 @@ impl Entity {
                 /// 查询所有数据，包括已删除的数据
                 pub async fn select_all_include_deleted(ctx: &mut sqlx_context::DbContext) -> Result<Vec<[ENTITY]>, sqlx::Error>
                 {
-                    sqlx::query_as!([ENTITY], "SELECT * FROM [TABLE]")
+                    sqlx::query_as!([ENTITY], "[SELECT] * [FROM] [TABLE]")
                         .fetch_all(ctx)
                         .await
                 }
@@ -330,7 +305,7 @@ impl Entity {
                 /// 查询所有
                 pub async fn select_all(ctx: &mut sqlx_context::DbContext) -> Result<Vec<[ENTITY]>, sqlx::Error>
                 {
-                    sqlx::query_as!([ENTITY], "SELECT * FROM [TABLE]")
+                    sqlx::query_as!([ENTITY], "[SELECT] * [FROM] [TABLE]")
                         .fetch_all(ctx)
                         .await
                 }
@@ -341,7 +316,10 @@ impl Entity {
         templates
             .iter()
             .map(|it| -> String {
-                it.replace("[TABLE]", &self.name)
+                it.replace("[SELECT]", &kw("SELECT"))
+                    .replace("[FROM]", &kw("FROM"))
+                    .replace("[WHERE_KW]", &kw("WHERE"))
+                    .replace("[TABLE]", &self.name)
                     .replace("[ENTITY]", &utils::snake_to_pascal(&self.name, "_"))
             })
             .collect::<Vec<_>>()
@@ -367,23 +345,17 @@ impl Entity {
                 if it.is_primary_key {
                     return false;
                 }
-                if it.name == "created_at" {
-                    return false;
-                }
-                if it.name == "deleted_at" {
-                    return false;
-                }
-                if it.name == "deleted" {
-                    return false;
-                }
-                if it.name == "version" {
-                    return false;
-                }
-                true
+
+                //created_at/deleted_at/deleted/version 不通过update修改
+                !(self.is_convention(it)
+                    && matches!(
+                        it.name.as_str(),
+                        "created_at" | "deleted_at" | "deleted" | "version"
+                    ))
             })
             .for_each(|it| {
                 update_columns.push(format!("{} = ?", it.name));
-                if it.name == "updated_at" {
+                if it.name == "updated_at" && self.is_convention(it) {
                     timestamp = "let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;".to_string();
                     update_params.push("timestamp".to_string());
                 } else {
@@ -409,18 +381,21 @@ impl Entity {
             where_columns.push("deleted = 0".to_string());
         }
 
-        // 构建更新SQL语句
-        let update_sql = format!(
-            "UPDATE {} SET {} WHERE {}",
-            self.name,
-            update_columns.join(", "),
-            where_columns.join(" AND ")
-        );
-
-        if where_columns.is_empty() {
-            // 如果没有WHERE条件则不生成更新函数以避免误操作
+        if where_columns.is_empty() || update_columns.is_empty() {
+            // 如果没有WHERE条件则不生成更新函数以避免误操作;没有可更新的列时SQL不合法,也不生成
             return String::new();
         }
+
+        // 构建更新SQL语句
+        let update_sql = format!(
+            "{} {} {} {} {} {}",
+            kw("UPDATE"),
+            self.name,
+            kw("SET"),
+            update_columns.join(", "),
+            kw("WHERE"),
+            where_columns.join(&format!(" {} ", kw("AND")))
+        );
 
         r##"
         /// 更新数据
@@ -431,12 +406,14 @@ impl Entity {
             let rs = sqlx::query!(
             "[SQL]",
             [PARAM]
-            ).execute(ctx).await?;
+            ).execute(&mut *ctx).await?;
+            [WRITE_LOG]
             let count = rs.rows_affected();
             Ok(count)
         }
         "##
             .replace("[TIMESTAMP]", timestamp.as_str())
+            .replace("[WRITE_LOG]", &utils::write_log_src(&format!("\"{}\"", update_sql), &update_params))
             .replace("[SQL]", &update_sql)
             .replace("[PARAM]", &(update_params.join(", ")))
             .replace("[ENTITY]", self.entity_name().as_str())
@@ -444,98 +421,23 @@ impl Entity {
 
     /// 生成删除函数的源代码
     pub fn make_set_delete_func(&self) -> String {
-        if !self.has_deleted() {
-            return String::new();
-        }
-        let mut where_columns = Vec::new(); // 构建WHERE条件列列表
-        let mut sql_params: Vec<&str> = Vec::new(); // 构建删除参数列表
-        let mut func_params: Vec<String> = Vec::new(); // 构建函数参数列表
-        let mut update_fields = vec!["deleted = 1"]; // 构建更新字段列表
-        self.primary_key_columns().for_each(|it| {
-            func_params.push(format!(
-                "{}: {}",
-                it.name,
-                table_util::db_type_to_rust(&it.data_type, &it.name)
-            ));
-            where_columns.push(format!("{} = ?", it.name));
-        });
-        if where_columns.is_empty() {
-            // 如果没有主键列则不生成删除函数以避免误操作
-            return String::new();
-        }
-
-        if self.has_version() {
-            // 如果有version列则在删除时自动加1以实现乐观锁
-            func_params.push("version: i64".to_string());
-            where_columns.push("version = ?".to_string());
-            update_fields.push("version = version + 1");
-        }
-
-        let mut timestamp = String::new();
-        if self.has_deleted_at() {
-            timestamp = "let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;".to_string();
-
-            // 如果有deleted_at列则在删除时自动设置删除时间
-            update_fields.push("deleted_at = ?");
-        }
-        if self.has_deleted_by() {
-            // 如果有deleted_by列则在删除时自动设置删除者
-            update_fields.push("deleted_by = ?");
-            func_params.push("deleted_by: String".to_string());
-        }
-        where_columns.push("deleted = 0".to_string());
-
-        //------------------------------按照参数顺序添加------------------------------//
-        if self.has_deleted_at() {
-            // 如果有deleted_at列则在删除时自动设置删除时间
-            sql_params.push("timestamp");
-        }
-        if self.has_deleted_by() {
-            // 如果有deleted_by列则在删除时自动设置删除者
-            sql_params.push("deleted_by");
-        }
-        self.primary_key_columns().for_each(|it| {
-            sql_params.push(it.name.as_str());
-        });
-        if self.has_version() {
-            // 如果有version列则在删除时自动加1以实现乐观锁
-            sql_params.push("version");
-        }
-
-        let delete_sql = format!(
-            "UPDATE {} SET {} WHERE {}",
-            self.name,
-            update_fields.join(", "),
-            where_columns.join(" AND ")
-        );
-        r##"
-        /// 逻辑删除数据
-        pub async fn set_delete(
-            ctx: &mut sqlx_context::DbContext,
-            [FUNC_PARAMS]
-        ) -> Result<u64, sqlx::Error>
-        {
-            [TIMESTAMP]
-            let rs = sqlx::query!("[SQL]", [PARAM])
-                .execute(ctx)
-                .await?;
-            let count = rs.rows_affected();
-            Ok(count)
-        }
-        "##
-        .replace("[TIMESTAMP]", &timestamp)
-        .replace("[SQL]", &delete_sql)
-        .replace("[PARAM]", &sql_params.join(", "))
-        .replace("[FUNC_PARAMS]", &func_params.join(", "))
+        self.make_logic_delete_func("set_delete", true)
     }
 
     /// 生成删除忽略版本函数的源代码
     pub fn make_set_delete_ignore_version_func(&self) -> String {
+        self.make_logic_delete_func("set_delete_ignone_version", false)
+    }
+
+    /// 生成逻辑删除函数的源代码
+    /// `check_version`: 是否校验乐观锁(有version列时)
+    fn make_logic_delete_func(&self, fn_name: &str, check_version: bool) -> String {
         if !self.has_deleted() {
             return String::new();
         }
+        let check_version = check_version && self.has_version();
         let mut where_columns = Vec::new(); // 构建WHERE条件列列表
-        let mut sql_params: Vec<&str> = Vec::new(); // 构建删除参数列表
+        let mut sql_params: Vec<String> = Vec::new(); // 构建删除参数列表
         let mut func_params: Vec<String> = Vec::new(); // 构建函数参数列表
         let mut update_fields = vec!["deleted = 1"]; // 构建更新字段列表
         self.primary_key_columns().for_each(|it| {
@@ -551,8 +453,13 @@ impl Entity {
             return String::new();
         }
 
+        if check_version {
+            // 如果有version列则校验乐观锁
+            func_params.push("version: i64".to_string());
+            where_columns.push("version = ?".to_string());
+        }
         if self.has_version() {
-            // 如果有version列则在删除时自动加1以实现乐观锁
+            // 如果有version列则在删除时自动加1
             update_fields.push("version = version + 1");
         }
 
@@ -572,39 +479,46 @@ impl Entity {
 
         //------------------------------按照参数顺序添加------------------------------//
         if self.has_deleted_at() {
-            // 如果有deleted_at列则在删除时自动设置删除时间
-            sql_params.push("timestamp");
+            sql_params.push("timestamp".to_string());
         }
         if self.has_deleted_by() {
-            // 如果有deleted_by列则在删除时自动设置删除者
-            sql_params.push("deleted_by");
+            sql_params.push("deleted_by".to_string());
         }
         self.primary_key_columns().for_each(|it| {
-            sql_params.push(it.name.as_str());
+            sql_params.push(it.name.clone());
         });
+        if check_version {
+            sql_params.push("version".to_string());
+        }
 
         let delete_sql = format!(
-            "UPDATE {} SET {} WHERE {}",
+            "{} {} {} {} {} {}",
+            kw("UPDATE"),
             self.name,
+            kw("SET"),
             update_fields.join(", "),
-            where_columns.join(" AND ")
+            kw("WHERE"),
+            where_columns.join(&format!(" {} ", kw("AND")))
         );
         r##"
         /// 逻辑删除数据
-        pub async fn set_delete_ignone_version(
+        pub async fn [FN_NAME](
             ctx: &mut sqlx_context::DbContext,
             [FUNC_PARAMS]
         ) -> Result<u64, sqlx::Error>
         {
             [TIMESTAMP]
             let rs = sqlx::query!("[SQL]", [PARAM])
-                .execute(ctx)
+                .execute(&mut *ctx)
                 .await?;
+            [WRITE_LOG]
             let count = rs.rows_affected();
             Ok(count)
         }
         "##
+        .replace("[FN_NAME]", fn_name)
         .replace("[TIMESTAMP]", &timestamp)
+        .replace("[WRITE_LOG]", &utils::write_log_src(&format!("\"{}\"", delete_sql), &sql_params))
         .replace("[SQL]", &delete_sql)
         .replace("[PARAM]", &sql_params.join(", "))
         .replace("[FUNC_PARAMS]", &func_params.join(", "))
@@ -613,40 +527,41 @@ impl Entity {
     /// 生成物理删除函数的源代码
     pub fn make_delete_func(&self) -> String {
         let mut where_columns = Vec::new(); // 构建WHERE条件列列表
-        let mut sql_params: Vec<&str> = Vec::new(); // 构建删除参数列表
+        let mut sql_params: Vec<String> = Vec::new(); // 构建删除参数列表
         let mut func_params: Vec<String> = Vec::new(); // 构建函数参数列表
-        self.columns
-            .iter()
-            .filter(|it| it.is_primary_key)
-            .for_each(|it| {
-                sql_params.push(it.name.as_str());
-                func_params.push(format!(
-                    "{}: {}",
-                    it.name,
-                    table_util::db_type_to_rust(&it.data_type, &it.name)
-                ));
-                where_columns.push(format!("{} = ?", it.name));
-            });
+        self.primary_key_columns().for_each(|it| {
+            sql_params.push(it.name.clone());
+            func_params.push(format!(
+                "{}: {}",
+                it.name,
+                table_util::db_type_to_rust(&it.data_type, &it.name)
+            ));
+            where_columns.push(format!("{} = ?", it.name));
+        });
         if where_columns.is_empty() {
             // 如果没有主键列则不生成删除函数以避免误操作
             return String::new();
         }
         let delete_sql = format!(
-            "DELETE FROM {} WHERE {}",
+            "{} {} {} {}",
+            kw("DELETE FROM"),
             self.name,
-            where_columns.join(" AND ")
+            kw("WHERE"),
+            where_columns.join(&format!(" {} ", kw("AND")))
         );
         r##"
         /// 物理删除数据
         pub async fn delete(ctx: &mut sqlx_context::DbContext, [FUNC_PARAMS]) -> Result<u64, sqlx::Error>
         {
             let rs = sqlx::query!("[SQL]", [PARAM])
-                .execute(ctx)
+                .execute(&mut *ctx)
                 .await?;
+            [WRITE_LOG]
             let count = rs.rows_affected();
             Ok(count)
         }
         "##
+        .replace("[WRITE_LOG]", &utils::write_log_src(&format!("\"{}\"", delete_sql), &sql_params))
         .replace("[SQL]", &delete_sql)
         .replace("[PARAM]", &sql_params.join(", "))
         .replace("[FUNC_PARAMS]", &func_params.join(", "))

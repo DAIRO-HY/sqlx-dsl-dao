@@ -291,9 +291,14 @@ fn parse_if_condition(lines: &Vec<&str>, i: &mut usize) -> DslBlock {
     if *i >= lines.len(){
         panic!("没有找到-- @end 标记")
     }
-    while !lines[*i].starts_with("-- @end") {
+    while !lines[*i].trim().starts_with("-- @end") {
+        //多行之间保留换行,避免前后两行的SQL粘在一起
         content.push_str(lines[*i]);
+        content.push('\n');
         *i = *i + 1;
+        if *i >= lines.len() {
+            panic!("没有找到-- @end 标记")
+        }
     }
     DslBlock {
         controller: Some(DslController::If(symbols)),

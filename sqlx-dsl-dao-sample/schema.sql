@@ -17,3 +17,12 @@ CREATE TABLE IF NOT EXISTS tag ( -- 标签
     id INTEGER PRIMARY KEY AUTOINCREMENT, -- 主键
     name VARCHAR NOT NULL -- 标签名
 );
+
+-- 设备表：演示业务生成的非自增主键、关闭约定字段
+CREATE TABLE IF NOT EXISTS device ( -- 设备
+    id INT8 PRIMARY KEY NOT NULL, -- 主键（业务生成，非自增，insert 时必须带上）
+    name VARCHAR(64) COLLATE NOCASE NOT NULL,-- 设备名
+    online INTEGER NOT NULL DEFAULT 0, -- 是否在线
+    weight DOUBLE NULL, -- 重量
+    version INT NOT NULL -- 客户端版本号，不是乐观锁（build.rs 里关闭了 device.version 约定）
+);

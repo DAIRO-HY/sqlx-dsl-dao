@@ -23,17 +23,30 @@ use std::collections::HashMap;
 
 pub mod table_dao;
 pub mod dsl_dao;
+mod config;
 mod utils;
 mod write_util;
+
+pub use config::GenerateConfig;
 
 /// 生成 DAO 相关代码：先根据表结构生成基础 CRUD，再根据 DSL 文件生成动态 SQL 函数，最后统一写入 OUT_DIR/dao.rs
 ///
 /// `type_overrides`: 字段名 -> Rust类型 的覆盖规则,用于项目自定义的字段命名约定(如某些字段虽是DATETIME类型,但希望生成为String)
+///
+/// 需要更多配置(关闭约定字段、小写SQL关键字)时使用 [`generate_with_config()`]
 pub async fn generate(conn: SqlitePool, dsl_dir: &str, type_overrides: &HashMap<String, String>) {
-    table_util::set_type_overrides(type_overrides);
+    generate_with_config(conn, dsl_dir, &GenerateConfig::new().type_overrides(type_overrides)).await;
+}
+
+/// 按 [`GenerateConfig`] 生成 DAO 相关代码,其余行为与 [`generate()`] 相同
+pub async fn generate_with_config(conn: SqlitePool, dsl_dir: &str, config: &GenerateConfig) {
+    config::set(config);
 
     //得到某个数据库中所有表的Entity信息
     let table_entities = table_util::all_entities(&conn).await;
+
+    //DSL中未声明类型的参数,优先按同名表字段推断类型
+    table_util::set_schema_columns(&table_entities);
 
     for entity in table_entities {
         let mod_name = &entity.name;

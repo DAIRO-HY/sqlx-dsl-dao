@@ -31,23 +31,33 @@ impl DslBlock {
     }
 
     /// 获取添加参?传值的代码
-    pub fn block_src(&self, need_param: bool) -> String {
+    /// `write_log`: 是否同时生成收集写日志参数的代码(写SQL使用)
+    pub fn block_src(&self, need_param: bool, write_log: bool) -> String {
         let (native_sql, args) = table_util::parse_sql_args(&self.sql);
         let var_name = if need_param { "param." } else { "" };
+
+        //绑定一个参数的代码,`value`为不带&的参数表达式
+        let add_arg_src = |bind: String, value: String| -> String {
+            let mut src = format!("sqlx::Arguments::add(&mut __args, {}).unwrap();\n", bind);
+            if write_log {
+                src.push_str(&format!(
+                    "if __log_enabled {{ __log_params.push(sqlx_context::log_value(&({}))); }}\n",
+                    value
+                ));
+            }
+            src
+        };
 
         let mut body = String::new();
 
         //没有流程控制
         let Some(controller) = &self.controller else {
             let add_args_src = args.iter().fold(String::new(), |mut pre, it| {
-                let add_arg_src = format!(
-                    "sqlx::Arguments::add(&mut args, &{}{}).unwrap();\n",
-                    var_name, it
-                );
-                pre.push_str(add_arg_src.as_str());
+                let value = format!("{}{}", var_name, it);
+                pre.push_str(&add_arg_src(format!("&{}", value), value));
                 pre
             });
-            body.push_str(format!("sql.push_str(r#\"{} \"#);\n", native_sql.trim()).as_str());
+            body.push_str(format!("__sql.push_str(r#\"{} \"#);\n", native_sql.trim()).as_str());
             body.push_str(&add_args_src);
             return body;
         };
@@ -57,14 +67,10 @@ impl DslBlock {
             // if流程控制
             DslController::If(conditions) => {
                 let add_args_src = args.iter().fold(String::new(), |mut pre, it| {
-                    let add_arg_src = format!(
-                        "sqlx::Arguments::add(&mut args, &{}{}).unwrap();\n",
-                        var_name, it
-                    );
-                    pre.push_str(add_arg_src.as_str());
+                    let value = format!("{}{}", var_name, it);
+                    pre.push_str(&add_arg_src(format!("&{}", value), value));
                     pre
                 });
-                body.push_str("if ");
 
                 //if条件代码
                 let if_condition_src = conditions
@@ -74,7 +80,7 @@ impl DslBlock {
                     .join("");
                 r##"
                     if [CONDITION] {
-                        sql.push_str(r#"[NATIVE_SQL] "#);
+                        __sql.push_str(r#"[NATIVE_SQL] "#);
                         [ADD_ARGS]
                     }
                 "##
@@ -86,37 +92,35 @@ impl DslBlock {
                 //要循环的变量名
                 let name = format!("{}{}", var_name, each.name);
                 let add_args_src = args.iter().fold(String::new(), |mut pre, it| {
-                    let add_arg_src = if it == &each.item
+                    let src = if it == &each.item
                         || it.starts_with(format!("{}.", &each.item).as_str())
                     {
                         //each循环不能在参数前加&,且不能加函数参数前缀
-                        format!("sqlx::Arguments::add(&mut args, {}).unwrap();\n", it)
+                        add_arg_src(it.clone(), it.clone())
                     } else {
-                        format!(
-                            "sqlx::Arguments::add(&mut args, &{}{}).unwrap();\n",
-                            var_name, it
-                        )
+                        let value = format!("{}{}", var_name, it);
+                        add_arg_src(format!("&{}", value), value)
                     };
-                    pre.push_str(add_arg_src.as_str());
+                    pre.push_str(&src);
                     pre
                 });
 
                 //删除最后一个分割字符串
                 let truncate_seq = if each.seq.len() > 0 {
-                    format!("//去掉最后一段分隔符\nsql.truncate(sql.len() - {});", each.seq.len())
+                    format!("//去掉最后一段分隔符\n__sql.truncate(__sql.len() - {});", each.seq.len())
                 }else{
                     "".to_string()
                 };
                 r##"
                     if [NAME].len() > 0 {
-                         sql.push_str("[OPEN]");
+                         __sql.push_str("[OPEN]");
                          [NAME].iter().for_each(|[ITEM]|{
-                            sql.push_str(r#"[NATIVE_SQL][SEQ]"#);
+                            __sql.push_str(r#"[NATIVE_SQL][SEQ]"#);
                             [ADD_ARGS]
                          });
                          [TRUNCATE_SEQ]
-                         sql.push_str("[CLOSE]");
-                         sql.push_str(" ");
+                         __sql.push_str("[CLOSE]");
+                         __sql.push_str(" ");
                      }
                 "##
                 .replace("[NAME]", &name)

@@ -1,3 +1,4 @@
+use crate::utils;
 use crate::write_util;
 use crate::dsl_dao::model::dsl_function::DslFunction;
 use crate::table_dao::model::CrudType;
@@ -37,7 +38,10 @@ fn make_method_src(dsl: &DslFunction) -> String {
     let exec_sql: String;
 
     // 执行sql需要的参数
-    let mut exec_args = "args".to_string();
+    let mut exec_args = "__args".to_string();
+
+    // 写SQL执行成功后记录写日志的代码
+    let mut write_log = String::new();
 
     if dsl.return_option{
         return_type = format!("Option<{}>", return_type);
@@ -52,61 +56,61 @@ fn make_method_src(dsl: &DslFunction) -> String {
         } else {
             query_func = "query_as_with::<_, [BIND_TYPE], _>"
         }
-        exec_sql = dsl.concat_sql_src();
+        exec_sql = dsl.concat_sql_src(false);
 
         //分页查询时
         r##"
         /// [COMMENT]
         pub async fn [FN_NAME](ctx: &mut sqlx_context::DbContext, page_in: super::PageIn, [METHOD_PARAM]) -> Result<(i64,Vec<[RETURN_TYPE]>), sqlx::Error>
         {
-            let mut sql = String::new();
-            let mut args = sqlx::sqlite::SqliteArguments::default();
+            let mut __sql = String::new();
+            let mut __args = sqlx::sqlite::SqliteArguments::default();
             [METHOD_PARAM_AS_REF]
             [EXEC_SQL]
 
-            let mut sql = sql.trim();
+            let mut __sql = __sql.trim();
 
             //去掉sql文中的最后一个分号
-            if sql.ends_with(";"){
-                sql = &sql[0..sql.len() - 1];
+            if __sql.ends_with(";"){
+                __sql = &__sql[0..__sql.len() - 1];
             }
 
             //用来查询数据条数的sql
-            let sql_count = format!("select count(*) from ({}) as temp;", sql);
+            let __sql_count = format!("select count(*) from ({}) as temp;", __sql);
 
             //设置默认页数
-            let page = if page_in.page > 0{
+            let __page = if page_in.page > 0{
                 page_in.page
             } else {
                 1
             };
 
             //设置默认页面大小
-            let page_size    = if page_in.page_size > 0{
+            let __page_size    = if page_in.page_size > 0{
                 page_in.page_size
             } else {
                 10
             };
-            let mut order_by = String::new();
+            let mut __order_by = String::new();
             if !page_in.sort_key.is_empty() {
 
                 //验证排序方式是否非法
                 page_in.check_order_by()?;
-                order_by = format!("order by {} {}", page_in.sort_key, page_in.sort_type)
+                __order_by = format!("order by {} {}", page_in.sort_key, page_in.sort_type)
             }
 
             //查询数据的sql
-            let sql_data = format!("select * from ({}) as temp {} limit {},{};", sql, order_by, (page - 1) * page_size, page_size);
+            let __sql_data = format!("select * from ({}) as temp {} limit {},{};", __sql, __order_by, (__page - 1) * __page_size, __page_size);
 
             //得到总数据条数
-            let count = sqlx::query_scalar_with::<_,i64,_>(&sql_count, [ARGS].clone()).fetch_one(&mut *ctx).await?;
-            if count == 0{//没有数据,直接返回
+            let __count = sqlx::query_scalar_with::<_,i64,_>(&__sql_count, [ARGS].clone()).fetch_one(&mut *ctx).await?;
+            if __count == 0{//没有数据,直接返回
                 return Ok((0,Default::default()));
             }
 
             //查询到数据
-            let data = sqlx::[QUERY_FUNC](&sql_data, [ARGS]).fetch_all(ctx).await?;
-            Ok((count, data))
+            let __data = sqlx::[QUERY_FUNC](&__sql_data, [ARGS]).fetch_all(ctx).await?;
+            Ok((__count, __data))
         }"##
     } else {
         match dsl.crud_type() {
@@ -128,16 +132,16 @@ fn make_method_src(dsl: &DslFunction) -> String {
                     } else {
                         query_func = "query_as_with::<_, [BIND_TYPE], _>"
                     }
-                    exec_sql = dsl.concat_sql_src();
+                    exec_sql = dsl.concat_sql_src(false);
                     r##"
                     /// [COMMENT]
                     pub async fn [FN_NAME](ctx: &mut sqlx_context::DbContext, [METHOD_PARAM]) -> Result<[RETURN_TYPE], sqlx::Error>
                     {
-                        let mut sql = String::new();
-                        let mut args = sqlx::sqlite::SqliteArguments::default();
+                        let mut __sql = String::new();
+                        let mut __args = sqlx::sqlite::SqliteArguments::default();
                         [METHOD_PARAM_AS_REF]
                         [EXEC_SQL]
-                        sqlx::[QUERY_FUNC](&sql, [ARGS]).[FETCH_TYPE](ctx).await
+                        sqlx::[QUERY_FUNC](&__sql, [ARGS]).[FETCH_TYPE](ctx).await
                     }
                     "##
                 } else {
@@ -174,16 +178,23 @@ fn make_method_src(dsl: &DslFunction) -> String {
                 //如果是动态生成sql语句,只能动态拼接
                 if dsl.has_if_condition() {
                     query_func = "query_with::<_, _>";
-                    exec_sql = dsl.concat_sql_src();
+                    exec_sql = dsl.concat_sql_src(true);
                     r##"
                     /// [COMMENT]
                     pub async fn [FN_NAME](ctx: &mut sqlx_context::DbContext, [METHOD_PARAM]) -> Result<u64, sqlx::Error>
                     {
-                        let mut sql = String::new();
-                        let mut args = sqlx::sqlite::SqliteArguments::default();
+                        let mut __sql = String::new();
+                        let mut __args = sqlx::sqlite::SqliteArguments::default();
+
+                        //开启写日志时,拼接SQL的同时收集参数
+                        let __log_enabled = ctx.is_write_log_enabled();
+                        let mut __log_params: Vec<sqlx_context::serde_json::Value> = Vec::new();
                         [METHOD_PARAM_AS_REF]
                         [EXEC_SQL]
-                        let rs = sqlx::[QUERY_FUNC](&sql, [ARGS]).[FETCH_TYPE](ctx).await?;
+                        let rs = sqlx::[QUERY_FUNC](&__sql, [ARGS]).[FETCH_TYPE](&mut *ctx).await?;
+                        if __log_enabled {
+                            ctx.push_write_log(__sql, __log_params);
+                        }
     
                         //返回影响的行数
                         Ok(rs.rows_affected())
@@ -192,13 +203,17 @@ fn make_method_src(dsl: &DslFunction) -> String {
                 }
                 //没有条件渲染,直接使用sqlx宏,提高性能
                 else {
-                    (exec_sql, exec_args) = dsl.native_sql_and_args();
+                    let arg_list;
+                    (exec_sql, arg_list) = dsl.native_sql_and_arg_list();
+                    exec_args = arg_list.join(", ");
+                    write_log = utils::write_log_src(&format!("r#\"{}\"#", exec_sql), &arg_list);
                     r##"
                     /// [COMMENT]
                     pub async fn [FN_NAME](ctx: &mut sqlx_context::DbContext, [METHOD_PARAM]) -> Result<u64, sqlx::Error>
                     {
                         [METHOD_PARAM_AS_REF]
-                        let rs = sqlx::query!(r#"[EXEC_SQL]"#, [ARGS]).[FETCH_TYPE](ctx).await?;
+                        let rs = sqlx::query!(r#"[EXEC_SQL]"#, [ARGS]).[FETCH_TYPE](&mut *ctx).await?;
+                        [WRITE_LOG]
     
                         //返回影响的行数
                         Ok(rs.rows_affected())
@@ -213,6 +228,7 @@ fn make_method_src(dsl: &DslFunction) -> String {
         .replace("[FN_NAME]", &dsl.name)
         .replace("[METHOD_PARAM]", &dsl.method_param_src())
         .replace("[METHOD_PARAM_AS_REF]", &dsl.method_param_as_ref_src())
+        .replace("[WRITE_LOG]", &write_log)
         .replace("[RETURN_TYPE]", &return_type)
         .replace("[QUERY_FUNC]", query_func)
         .replace("[BIND_TYPE]", &bind_type)

@@ -154,13 +154,26 @@ impl DslFunction {
     }
 
     /// sql拼接部分的代码
-    pub fn concat_sql_src(&self) -> String {
+    /// `write_log`: 是否同时生成收集写日志参数的代码
+    pub fn concat_sql_src(&self, write_log: bool) -> String {
         let need_param = self.param_type.is_some();
         self.block_list
             .iter()
-            .map(|sql_item| sql_item.block_src(need_param))
+            .map(|sql_item| sql_item.block_src(need_param, write_log))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 生成原生sql文和需要的参数表达式列表
+    pub fn native_sql_and_arg_list(&self) -> (String, Vec<String>) {
+        let (native_sql, args) = table_util::parse_sql_args(self.no_control_sql().as_str());
+        let var_name = if self.param_type.is_some() {
+            "param."
+        } else {
+            ""
+        };
+        let args = args.iter().map(|it| format!("{}{}", var_name, it)).collect();
+        (native_sql.trim().to_string(), args)
     }
 
     /// 生成原生sql文和需要的参数代码
@@ -217,8 +230,8 @@ impl DslFunction {
 
     /// 修复函数参数,比如参数不足时,补充缺少的参数
     pub async fn fix_params(&self, conn: &SqlitePool) -> DslFunction {
-        //返回的列的set
-        let result_column_set =
+        //返回的列的set;写SQL没有返回列,且去掉@if/@each后剩下的SQL可能不完整,不做describe
+        let result_column_set = if self.crud_type() == CrudType::Read {
             self.result_entity(conn)
                 .await
                 .columns
@@ -226,26 +239,25 @@ impl DslFunction {
                 .fold(HashMap::new(), |mut pre, it| {
                     pre.insert(it.name.clone(), it.clone());
                     pre
-                });
+                })
+        } else {
+            HashMap::new()
+        };
 
-        //得到sql文中需要的参数
-        let sql_args_set = self.block_list.iter().fold(HashSet::new(), |mut pre, it| {
+        //得到sql文中需要的参数,按在sql中第一次出现的顺序排列,保证生成的函数参数顺序稳定
+        let mut sql_args_set = Vec::new();
+        self.block_list.iter().for_each(|it| {
             let (_, args) = it.native_sql_and_args();
-            let Some(controller) = &it.controller else {
-                pre.extend(args);
-                return pre;
-            };
-            match controller {
-                DslController::Each(each) => args.into_iter().for_each(|it| {
-                    if it != each.item && !it.starts_with(format!("{}.", &each.item).as_str()) {
-                        pre.insert(it);
+            args.into_iter().for_each(|arg| {
+                if let Some(DslController::Each(each)) = &it.controller {
+                    if arg == each.item || arg.starts_with(format!("{}.", &each.item).as_str()) {
+                        return;
                     }
-                }),
-                _ => {
-                    pre.extend(args);
                 }
-            }
-            pre
+                if !sql_args_set.contains(&arg) {
+                    sql_args_set.push(arg);
+                }
+            });
         });
 
         //dsl中已经配置了的参数
@@ -278,7 +290,8 @@ impl DslFunction {
         //修复函数参数,补足没有配置的参数
         sql_args_set.iter().for_each(|it| {
             if !current_param_set.contains(it) {
-                let ty = if it == "id" {
+                //和表字段同名时使用表字段的类型(写SQL没有返回列可以匹配)
+                let ty = table_util::schema_column_type(it).unwrap_or_else(|| if it == "id" {
                     "i64"
                 } else if it.to_lowercase().ends_with("date") {
                     "chrono::NaiveDateTime"
@@ -287,7 +300,7 @@ impl DslFunction {
                 } else {
                     "String"
                 }
-                .to_string();
+                .to_string());
 
                 //该参数没有配置
                 params.push(DslParam {

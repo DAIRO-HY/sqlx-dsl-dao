@@ -1507,11 +1507,10 @@ dependencies = [
 
 [[package]]
 name = "sqlx-context"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a93a92ed60e36e35755a6c49f91f9f89ab15e5a789f971b316ab814f4e51146c"
+version = "0.0.2"
 dependencies = [
  "futures-core",
+ "serde_json",
  "sqlx",
 ]
 
@@ -1553,13 +1552,25 @@ dependencies = [
 
 [[package]]
 name = "sqlx-dsl-dao"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "prettyplease",
  "serde",
  "sqlx",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "sqlx-dsl-dao-dfs-compat"
+version = "0.0.1"
+dependencies = [
+ "async-std",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "sqlx-context",
+ "sqlx-dsl-dao",
 ]
 
 [[package]]

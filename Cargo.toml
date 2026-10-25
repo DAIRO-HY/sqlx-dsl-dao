@@ -1,3 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["sqlx-dsl-dao-sample", "sqlx-dsl-dao"]
+members = ["sqlx-dsl-dao-sample", "sqlx-dsl-dao", "sqlx-dsl-dao-dfs-compat"]
+
+# sqlx-context 0.0.2 发布到 crates.io 之前,先使用本地源码
+[patch.crates-io]
+sqlx-context = { path = "../sqlx-context/sqlx-context" }

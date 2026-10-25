@@ -1,15 +1,32 @@
 use crate::table_dao::model::{CrudType, table};
 use sqlx::{Column, Executor, Row, SqliteConnection, SqlitePool, Statement, TypeInfo};
+use crate::config;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-/// 字段名 -> Rust类型 的覆盖规则,由使用方通过 `generate()` 传入(项目自定义的字段命名约定无法内置在库里)
-static TYPE_OVERRIDES: LazyLock<Mutex<HashMap<String, String>>> =
+/// 所有表的 列名 -> Rust类型(同名列在不同表里类型不一致时为 None)
+static SCHEMA_COLUMNS: LazyLock<Mutex<HashMap<String, Option<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 设置字段名 -> Rust类型 的覆盖规则,供 `generate()` 在生成前调用
-pub(crate) fn set_type_overrides(overrides: &HashMap<String, String>) {
-    *TYPE_OVERRIDES.lock().unwrap() = overrides.clone();
+/// 记录所有表的列类型,供DSL推断未声明类型的参数
+pub(crate) fn set_schema_columns(entities: &[table::Entity]) {
+    let mut map: HashMap<String, Option<String>> = HashMap::new();
+    for column in entities.iter().flat_map(|it| it.columns.iter()) {
+        let ty = db_type_to_rust(&column.data_type, &column.name);
+        map.entry(column.name.clone())
+            .and_modify(|it| {
+                if it.as_ref() != Some(&ty) {
+                    *it = None;
+                }
+            })
+            .or_insert(Some(ty));
+    }
+    *SCHEMA_COLUMNS.lock().unwrap() = map;
+}
+
+/// 按列名从表结构中查找Rust类型
+pub(crate) fn schema_column_type(name: &str) -> Option<String> {
+    SCHEMA_COLUMNS.lock().unwrap().get(name).cloned().flatten()
 }
 
 /// 读取某个数据库中所有表Entity
@@ -106,7 +123,7 @@ fn find_table_name(sql: &str) -> (String, String) {
     sql = sql.replace("\r", "\n");
     let create_table_index = sql.to_uppercase().find("CREATE TABLE").unwrap();
     sql = sql[create_table_index + 12..].trim().to_string();
-    if sql.starts_with("IF NOT EXISTS") {
+    if sql.to_uppercase().starts_with("IF NOT EXISTS") {
         sql = sql[13..].trim().to_string();
     }
 
@@ -158,10 +175,10 @@ fn read_column_info_from_sql_line(line: &str) -> Option<table::Column> {
     {
         return None;
     }
-    if column_name.to_uppercase() == "UNIQUE"
-        || column_name.to_uppercase() == "PRIMARY"
-        || column_name.to_uppercase() == "FOREIGN"
-    {
+    if matches!(
+        column_name.to_uppercase().as_str(),
+        "UNIQUE" | "PRIMARY" | "FOREIGN" | "CONSTRAINT" | "CHECK"
+    ) {
         return None;
     }
 
@@ -349,9 +366,9 @@ pub fn parse_sql_args(sql: &str) -> (String, Vec<String>) {
 
 /// 将数据库数据类型映射为Rust类型
 pub fn db_type_to_rust(db_type: &str, name: &str) -> String {
-    //优先使用调用方通过 generate() 传入的字段名覆盖规则
-    if let Some(rust_type) = TYPE_OVERRIDES.lock().unwrap().get(name) {
-        return rust_type.clone();
+    //优先使用调用方通过 GenerateConfig 配置的字段名覆盖规则
+    if let Some(rust_type) = config::type_override(name) {
+        return rust_type;
     }
     match db_type.to_uppercase().as_str() {
         "INTEGER" | "INT" => "i64".to_string(),
@@ -376,5 +393,59 @@ pub fn db_type_to_rust(db_type: &str, name: &str) -> String {
                 db_type.to_string()
             }
         } // 默认使用String类型
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_dfs_file_ddl() {
+        let entity = read_table_info_from_sql(
+            "CREATE TABLE dfs_file
+(
+    id          INT8 PRIMARY KEY            NOT NULL,           -- 主键
+    userId      INT8                        NOT NULL,-- 所属用户ID
+    parentId    INT8                        NOT NULL DEFAULT 0, -- 父目录ID,当isExtra=1时
+    name        VARCHAR(256) COLLATE NOCASE NOT NULL,           -- 名称(比较时忽略大小写)
+    contentType VARCHAR(32)                 NULL,               -- 文件类型(文件专用)
+    property    text                        NULL,
+    thumb       INT8,-- 缩略图
+    state       INTEGER          NOT NULL default 1,
+    apiToken    VARCHAR(20) unique, -- API操作TOKEN
+    stateMsg    TEXT                        NULL                -- 文件处理出错信息
+)",
+        );
+        assert_eq!(entity.name, "dfs_file");
+        let columns: Vec<(&str, &str, bool, bool, bool)> = entity
+            .columns
+            .iter()
+            .map(|it| {
+                (
+                    it.name.as_str(),
+                    it.data_type.as_str(),
+                    it.is_primary_key,
+                    it.is_auto_increment,
+                    it.is_nullable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                ("id", "INT8", true, false, false),
+                ("userId", "INT8", false, false, false),
+                ("parentId", "INT8", false, false, false),
+                ("name", "VARCHAR(256)", false, false, false),
+                ("contentType", "VARCHAR(32)", false, false, true),
+                ("property", "text", false, false, true),
+                ("thumb", "INT8", false, false, true),
+                ("state", "INTEGER", false, false, false),
+                ("apiToken", "VARCHAR(20)", false, false, true),
+                ("stateMsg", "TEXT", false, false, true),
+            ]
+        );
+        assert_eq!(entity.columns[1].comment, "所属用户ID");
     }
 }

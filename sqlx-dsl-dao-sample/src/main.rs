@@ -135,5 +135,178 @@ async fn main() -> Result<(), sqlx::Error> {
     println!("标签: {:?}", tags);
     tag_dao::delete(&mut ctx, tag_id).await?;
 
+    // ------------------------- 非自增主键 / 关闭约定字段 -------------------------
+
+    // id 是业务生成的非自增主键，insert 会带上它；version 关闭了约定，按普通列插入
+    let device = device_dao::Device {
+        id: 1001,
+        name: "Pad".to_string(),
+        online: 1,
+        weight: Some(0.5), // 可为空的列 -> Option<f64>
+        version: 3,        // 客户端版本号
+    };
+
+    // ------------------------- 写SQL日志 -------------------------
+
+    // 开启后，生成的写函数执行成功时会记录（实际执行的SQL, 参数）
+    ctx.enable_write_log();
+    ctx.begin().await?;
+    device_dao::insert(&mut ctx, &device).await?;
+    device_dao::update_device(&mut ctx, device.id, Some(0.75), Some("Pad Pro".to_string())).await?;
+    device_dao::set_device_offline(&mut ctx, device.id).await?;
+    device_dao::delete_device_by_ids(&mut ctx, vec![device.id]).await?;
+
+    // commit 之前取出，和业务数据一起写到别处（如 sql_log 表）
+    for log in ctx.take_write_log() {
+        println!("写日志: {} {}", log.sql, log.params_json());
+    }
+    ctx.commit().await?;
+    ctx.disable_write_log();
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx_context::serde_json::json;
+
+    /// 每个测试一个独立的内存数据库
+    async fn memory_ctx() -> DbContext {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../schema.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        DbContext::new(pool)
+    }
+
+    fn device() -> device_dao::Device {
+        device_dao::Device {
+            id: 1001,
+            name: "Pad".to_string(),
+            online: 1,
+            weight: None,
+            version: 3,
+        }
+    }
+
+    #[async_std::test]
+    async fn no_write_log_unless_enabled() {
+        let mut ctx = memory_ctx().await;
+        device_dao::insert(&mut ctx, &device()).await.unwrap();
+        assert!(ctx.take_write_log().is_empty());
+    }
+
+    #[async_std::test]
+    async fn table_dao_write_log() {
+        let mut ctx = memory_ctx().await;
+        ctx.enable_write_log();
+
+        let mut device = device();
+        device_dao::insert(&mut ctx, &device).await.unwrap();
+        device.version = 4;
+        assert_eq!(device_dao::update(&mut ctx, &device).await.unwrap(), 1);
+        device_dao::delete(&mut ctx, device.id).await.unwrap();
+
+        let logs = ctx.take_write_log();
+        let sqls: Vec<&str> = logs.iter().map(|it| it.sql.as_str()).collect();
+        assert_eq!(
+            sqls,
+            [
+                // 关闭约定后 version 作为普通列插入
+                "INSERT INTO device (id, name, online, weight, version) VALUES (?, ?, ?, ?, ?)",
+                // 也没有乐观锁条件
+                "UPDATE device SET name = ?, online = ?, weight = ?, version = ? WHERE id = ?",
+                "DELETE FROM device WHERE id = ?",
+            ]
+        );
+        assert_eq!(logs[0].params, [json!(1001), json!("Pad"), json!(1), json!(null), json!(3)]);
+        assert_eq!(logs[1].params[3], json!(4));
+        assert_eq!(logs[2].params, [json!(1001)]);
+    }
+
+    #[async_std::test]
+    async fn convention_columns_still_work_on_other_tables() {
+        let mut ctx = memory_ctx().await;
+        ctx.enable_write_log();
+        let id = user_dao::insert(
+            &mut ctx,
+            &user_dao::User {
+                name: "Alice".to_string(),
+                email: "a@example.com".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let user = user_dao::select_one(&mut ctx, id).await.unwrap();
+        user_dao::set_delete(&mut ctx, id, user.version, "admin".to_string()).await.unwrap();
+
+        let logs = ctx.take_write_log();
+        assert_eq!(
+            logs[0].sql,
+            "INSERT INTO user (name, email, age, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING id"
+        );
+        assert_eq!(
+            logs[1].sql,
+            "UPDATE user SET deleted = 1, version = version + 1, deleted_at = ?, deleted_by = ? WHERE id = ? AND version = ? AND deleted = 0"
+        );
+        assert_eq!(logs[1].params[1], json!("admin"));
+        assert_eq!(logs[1].params[2], json!(id));
+    }
+
+    #[async_std::test]
+    async fn dsl_write_log_records_expanded_sql() {
+        let mut ctx = memory_ctx().await;
+        device_dao::insert(&mut ctx, &device()).await.unwrap();
+        device_dao::insert(&mut ctx, &device_dao::Device { id: 1002, ..device() }).await.unwrap();
+        ctx.enable_write_log();
+
+        device_dao::update_device(&mut ctx, 1001, Some(1.5), Some("Pad Pro".to_string())).await.unwrap();
+        device_dao::update_device(&mut ctx, 1001, None, None).await.unwrap();
+        device_dao::set_device_offline(&mut ctx, 1001).await.unwrap();
+        assert_eq!(device_dao::delete_device_by_ids(&mut ctx, vec![1001, 1002]).await.unwrap(), 2);
+        // 读操作不记录
+        device_dao::select_all(&mut ctx).await.unwrap();
+
+        let logs = ctx.take_write_log();
+        let logs: Vec<(&str, &Vec<_>)> = logs.iter().map(|it| (it.sql.as_str(), &it.params)).collect();
+        assert_eq!(
+            logs,
+            [
+                // @if 展开后的SQL
+                ("UPDATE device SET weight = ? , name = ? WHERE id = ? ", &vec![json!(1.5), json!("Pad Pro"), json!(1001)]),
+                ("UPDATE device SET weight = ? WHERE id = ? ", &vec![json!(null), json!(1001)]),
+                // DSL里手写的SQL保持原有大小写
+                ("update device set online = 0 where id = ?", &vec![json!(1001)]),
+                // @each 展开后的SQL
+                ("DELETE FROM device WHERE 1 = 0 OR id IN (?,?) ", &vec![json!(1001), json!(1002)]),
+            ]
+        );
+    }
+
+    #[async_std::test]
+    async fn rollback_discards_write_log() {
+        let mut ctx = memory_ctx().await;
+        ctx.enable_write_log();
+        ctx.begin().await.unwrap();
+        device_dao::insert(&mut ctx, &device()).await.unwrap();
+        ctx.rollback().await.unwrap();
+        assert!(ctx.take_write_log().is_empty());
+    }
+
+    #[async_std::test]
+    async fn failed_write_is_not_logged() {
+        let mut ctx = memory_ctx().await;
+        device_dao::insert(&mut ctx, &device()).await.unwrap();
+        ctx.enable_write_log();
+        // 主键冲突
+        assert!(device_dao::insert(&mut ctx, &device()).await.is_err());
+        assert!(ctx.take_write_log().is_empty());
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "sqlx-dsl-dao"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Build-time DAO code generator for sqlx (SQLite): generates CRUD from table schema plus dynamic-SQL functions from a MyBatis-like DSL."

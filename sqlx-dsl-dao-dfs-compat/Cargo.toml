@@ -1,0 +1,20 @@
+[package]
+name = "sqlx-dsl-dao-dfs-compat"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "用 DairoDFS 线上使用中的建表语句(sql/create/,原样拷贝,不做修改)验证 sqlx-dsl-dao 的兼容性"
+
+[dependencies]
+sqlx-context = "0.0.2"
+sqlx = { version = "0.8", features = ["runtime-async-std", "sqlite", "macros"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+async-std = { version = "1", features = ["attributes"] }
+serde_json = "1"
+
+[build-dependencies]
+sqlx-dsl-dao = { path = "../sqlx-dsl-dao" }
+sqlx = { version = "0.8", features = ["runtime-async-std", "sqlite", "macros"] }
+async-std = { version = "1", features = ["attributes"] }

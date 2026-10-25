@@ -35,8 +35,13 @@ async fn main() {
     // 字段名 -> Rust类型 的覆盖规则，示例项目中数据库字段类型都能被默认规则正确推断，故留空
     let type_overrides: HashMap<String, String> = HashMap::new();
 
+    let config = sqlx_dsl_dao::GenerateConfig::new()
+        .type_overrides(&type_overrides)
+        // device.version 是客户端版本号而不是乐观锁：按普通列生成 insert/update
+        .disable_convention("device.version");
+
     let dsl_dir = Path::new(&manifest_dir).join("dsl");
-    sqlx_dsl_dao::generate(pool, dsl_dir.to_str().unwrap(), &type_overrides).await;
+    sqlx_dsl_dao::generate_with_config(pool, dsl_dir.to_str().unwrap(), &config).await;
 
     // 让编译期的 sqlx::query!/query_as!/query_scalar! 宏，以及运行期代码都能找到同一个示例数据库
     println!("cargo:rustc-env=DATABASE_URL={}", db_url);

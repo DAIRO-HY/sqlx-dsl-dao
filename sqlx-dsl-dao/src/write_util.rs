@@ -86,8 +86,9 @@ pub fn add_entity(mod_name: &str, table: table::Entity) {
 
 /// 写入文件
 pub fn write() {
-    let source_map = METHOD_DAO_SOURCE_PREPARE.lock().unwrap();
-    let entity_file_map = METHOD_DAO_ENTITY_PREPARE.lock().unwrap();
+    //取出后清空,允许在同一个build.rs里多次调用generate()
+    let source_map = std::mem::take(&mut *METHOD_DAO_SOURCE_PREPARE.lock().unwrap());
+    let entity_file_map = std::mem::take(&mut *METHOD_DAO_ENTITY_PREPARE.lock().unwrap());
     let mut all_source = format!("// Generated at {}\n", chrono::Local::now().to_rfc3339());
 
     //导入共通部分代码
@@ -100,7 +101,10 @@ pub fn write() {
                 source.push_str(table.make_entity_struct().as_str());
             });
         }
-        all_source.push_str(format!("pub mod {}_dao {{\n{}\n}}\n", mod_name, source).as_str());
+        //表字段/参数名直接沿用数据库列名,可能不是蛇形命名(如 userId)
+        all_source.push_str(
+            format!("#[allow(non_snake_case)]\npub mod {}_dao {{\n{}\n}}\n", mod_name, source).as_str(),
+        );
     });
     format_and_write(&all_source);
 }
